@@ -300,7 +300,7 @@ class PipelineWorker(QThread):
 
     log_signal = Signal(str)
     progress_signal = Signal(int, int)
-    result_signal = Signal(bool, str)
+    result_signal = Signal(bool, int, str)
 
     def __init__(self, project: ProjectWrapper, operation: str, **kwargs: Any):
         super().__init__()
@@ -356,11 +356,11 @@ class PipelineWorker(QThread):
             else:
                 raise ValueError(f"Unknown pipeline operation: {self.operation}")
             self.log_signal.emit(message)
-            self.result_signal.emit(True, message)
+            self.result_signal.emit(True, self.failed_items, message)
         except Exception as error:
             message = str(error)
             self.log_signal.emit(f"ERROR: {message}")
-            self.result_signal.emit(False, message)
+            self.result_signal.emit(False, 0, message)
 
 
 # ---- Reusable UI helpers ---------------------------------------------------
@@ -563,21 +563,26 @@ class ProjectOverviewPage(QWidget):
             self.lbl_path.setText("Open or create a project to see its details.")
             self.lbl_stats.setText("No project data to display.")
             return
-        self.lbl_name.setText(project.name)
-        self.lbl_path.setText(project.project_path)
-        state = project.state
-        kind_name = {"lc": "Light Curve", "tp": "Target Pixel"}.get(state.kind, "Not selected yet")
-        downloads = len(project.get_downloaded_files())
-        graphs = len(project.get_graphs())
-        results = len(project.get_results())
-        failed_downloads = len(state.download_failed)
-        failed_processing = len(state.process_failed)
-        self.lbl_stats.setText(
-            f"Data type: {kind_name}\n"
-            f"Download successes recorded: {len(state.downloaded)}  |  Existing input files: {downloads}\n"
-            f"Graphs available for review: {graphs}  |  Unique shortlisted TIC IDs: {results}\n"
-            f"Recorded download failures: {failed_downloads}  |  Recorded processing failures: {failed_processing}"
-        )
+        try:
+            self.lbl_name.setText(project.name)
+            self.lbl_path.setText(project.project_path)
+            state = project.state
+            kind_name = {"lc": "Light Curve", "tp": "Target Pixel"}.get(state.kind, "Not selected yet")
+            downloads = len(project.get_downloaded_files())
+            graphs = len(project.get_graphs())
+            results = len(project.get_results())
+            failed_downloads = len(state.download_failed)
+            failed_processing = len(state.process_failed)
+            self.lbl_stats.setText(
+                f"Data type: {kind_name}\n"
+                f"Download successes recorded: {len(state.downloaded)}  |  Existing input files: {downloads}\n"
+                f"Graphs available for review: {graphs}  |  Unique shortlisted TIC IDs: {results}\n"
+                f"Recorded download failures: {failed_downloads}  |  Recorded processing failures: {failed_processing}"
+            )
+        except Exception as error:
+            self.lbl_name.setText(project.name)
+            self.lbl_path.setText(project.project_path)
+            self.lbl_stats.setText(f"Project state could not be loaded:\n{error}")
 
     def open_project_folder(self) -> None:
         project = self.main_win.current_project
@@ -590,7 +595,7 @@ class DownloadPage(QWidget):
         super().__init__()
         self.main_win = main_window
         self.worker: PipelineWorker | None = None
-        self._outcome: tuple[bool, str] | None = None
+        self._outcome: tuple[bool, int, str] | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -745,8 +750,8 @@ class DownloadPage(QWidget):
         self.progress.setValue(min(finished, max(total, 1)))
         self.progress.setFormat(f"{finished} / {total} commands")
 
-    def record_outcome(self, success: bool, message: str) -> None:
-        self._outcome = (success, message)
+    def record_outcome(self, success: bool, failed_count: int, message: str) -> None:
+        self._outcome = (success, failed_count, message)
 
     def thread_finished(self) -> None:
         worker, self.worker = self.worker, None
@@ -757,11 +762,13 @@ class DownloadPage(QWidget):
             worker.deleteLater()
         self.main_win.refresh_project_views()
         if self._outcome:
-            success, message = self._outcome
-            if success:
-                QMessageBox.information(self, "Download finished", message)
-            else:
+            success, failed_count, message = self._outcome
+            if not success:
                 QMessageBox.critical(self, "Download failed", message)
+            elif failed_count:
+                QMessageBox.warning(self, "Download completed with failures", message)
+            else:
+                QMessageBox.information(self, "Download finished", message)
         self._outcome = None
 
 
@@ -770,7 +777,7 @@ class ProcessPage(QWidget):
         super().__init__()
         self.main_win = main_window
         self.worker: PipelineWorker | None = None
-        self._outcome: tuple[bool, str] | None = None
+        self._outcome: tuple[bool, int, str] | None = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -896,8 +903,8 @@ class ProcessPage(QWidget):
         self.progress.setValue(min(finished, max(total, 1)))
         self.progress.setFormat(f"{finished} / {total} files")
 
-    def record_outcome(self, success: bool, message: str) -> None:
-        self._outcome = (success, message)
+    def record_outcome(self, success: bool, failed_count: int, message: str) -> None:
+        self._outcome = (success, failed_count, message)
 
     def thread_finished(self) -> None:
         worker, self.worker = self.worker, None
@@ -908,9 +915,18 @@ class ProcessPage(QWidget):
             worker.deleteLater()
         self.main_win.refresh_project_views()
         if self._outcome:
-            success, message = self._outcome
+            success, failed_count, message = self._outcome
             if not success:
                 QMessageBox.critical(self, "Processing failed", message)
+            elif failed_count:
+                QMessageBox.warning(self, "Processing completed with failures", message)
+                answer = QMessageBox.question(
+                    self, "Review available graphs",
+                    f"{message}\n\nOpen Candidate Review now?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
+                )
+                if answer == QMessageBox.Yes:
+                    self.main_win.navigate_to(4)
             else:
                 answer = QMessageBox.question(
                     self, "Processing finished",
@@ -1040,9 +1056,19 @@ class CandidateReviewPage(QWidget):
             self._update_buttons()
             return
 
-        self.graphs = project.get_graphs()
+        try:
+            self.graphs = project.get_graphs()
+            saved_state = project.load_review_state()
+        except Exception as error:
+            self.graphs = []
+            self.shortlist = []
+            self.list_widget.clear()
+            self.lbl_image.setPixmap(QPixmap())
+            self.lbl_image.setText("Could not load candidate review state.")
+            self.lbl_info.setText(str(error))
+            self._update_buttons()
+            return
         self._pixmap_cache.clear()  # refreshed graph files must not reuse stale/broken cached images
-        saved_state = project.load_review_state()
         self.shortlist = list(saved_state.get("shortlist", []))
         self.current_index = int(saved_state.get("last_index", 0) or 0)
         self.current_index = min(max(self.current_index, 0), max(0, len(self.graphs) - 1))
@@ -1225,8 +1251,11 @@ class CandidateReviewPage(QWidget):
                 QMessageBox.warning(self, "Open failed", f"Could not open graph file:\n{path}")
 
     def save_and_exit(self) -> None:
-        if self.save_current_state():
-            self.main_win.navigate_to(1 if self.main_win.current_project else 0)
+        try:
+            if self.save_current_state():
+                self.main_win.navigate_to(1 if self.main_win.current_project else 0)
+        except Exception:
+            return
 
 
 class ResultsExportPage(QWidget):
@@ -1277,7 +1306,15 @@ class ResultsExportPage(QWidget):
             self.lbl_count.setText("No project open")
             self.table.setRowCount(0)
             return
-        results = project.get_results()
+        try:
+            results = project.get_results()
+        except Exception as error:
+            self.lbl_count.setText("Could not load shortlisted results")
+            self.table.setRowCount(1)
+            self.table.setItem(0, 0, QTableWidgetItem("-"))
+            self.table.setItem(0, 1, QTableWidgetItem("Results unavailable"))
+            self.table.setItem(0, 2, QTableWidgetItem(str(error)))
+            return
         self.lbl_count.setText(f"{len(results)} unique shortlisted TIC ID(s)")
         self.table.setRowCount(len(results))
         for row, tic in enumerate(results, start=0):
@@ -1657,7 +1694,11 @@ class MainWindow(QMainWindow):
         self.update_project_indicator()
 
     def refresh_project_views(self) -> None:
-        self.page_overview.update_project_info(self.current_project)
+        try:
+            self.page_overview.update_project_info(self.current_project)
+        except Exception as error:
+            self.page_overview.lbl_name.setText("Project state unavailable")
+            self.page_overview.lbl_stats.setText(str(error))
         self.page_results.load_results()
 
     def show_create_project_dialog(self) -> None:
