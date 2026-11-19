@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="180" viewBox="0 0 760 180" role="img" aria-labelledby="title desc">
+  <title id="title">TESSify logo</title>
+  <desc id="desc">A futuristic exoplanet transit logo combining an orbiting planet, a bright star, and a transit light-curve dip, alongside the TESSify wordmark.</desc>
+  <defs>
+    <linearGradient id="orbitGradient" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#26C6F5"/>
+      <stop offset="1" stop-color="#7487FF"/>
+    </linearGradient>
+    <linearGradient id="planetGradient" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#263D72"/>
+      <stop offset="1" stop-color="#101A35"/>
+    </linearGradient>
+    <linearGradient id="curveGradient" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#26C6F5"/>
+      <stop offset="1" stop-color="#7487FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Standalone symbol, repeated here as the wordmark's icon. -->
+  <g transform="translate(12 10)">
+    <!-- Orbital path -->
+    <ellipse cx="76" cy="73" rx="58" ry="31" transform="rotate(-29 76 73)"
+             fill="none" stroke="url(#orbitGradient)" stroke-width="4.5" opacity="0.9"/>
+    <path d="M24 91 C34 105 50 113 68 116" fill="none" stroke="#26C6F5" stroke-width="4.5" stroke-linecap="round"/>
+
+    <!-- Central star -->
+    <circle cx="72" cy="65" r="20" fill="#FFC857" opacity="0.12"/>
+    <path d="M72 40 C76 55 82 61 97 65 C82 69 76 75 72 90 C68 75 62 69 47 65 C62 61 68 55 72 40Z"
+          fill="#FFC857"/>
+    <circle cx="72" cy="65" r="5" fill="#FFF4D6"/>
+
+    <!-- Transiting planet -->
+    <circle cx="111" cy="39" r="13.5" fill="url(#planetGradient)" stroke="#36D9F5" stroke-width="3"/>
+    <ellipse cx="111" cy="39" rx="21" ry="7.5" transform="rotate(-28 111 39)"
+             fill="none" stroke="#8290FF" stroke-width="2.5" opacity="0.9"/>
+
+    <!-- Transit light curve: a clean, characteristic dip -->
+    <path d="M18 132 H43 C51 132 54 132 59 137 C65 145 70 149 77 149 C84 149 89 145 95 137 C100 132 104 132 111 132 H135"
+          fill="none" stroke="url(#curveGradient)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="18" cy="132" r="3" fill="#26C6F5"/>
+    <circle cx="135" cy="132" r="3" fill="#7487FF"/>
+  </g>
+
+  <!-- Editable wordmark text -->
+  <text x="190" y="104" font-family="'Space Grotesk', 'Avenir Next', 'Montserrat', Arial, sans-serif"
+        font-size="76" font-weight="700" letter-spacing="-3.8" fill="#101A35">
+    TESS<tspan fill="#347FEA" font-weight="600">ify</tspan>
+  </text>
+  <text x="195" y="137" font-family="'Space Grotesk', 'Avenir Next', 'Montserrat', Arial, sans-serif"
+        font-size="15" font-weight="600" letter-spacing="3.2" fill="#65718D">
+    EXOPLANET TRANSIT DETECTION
+  </text>
+</svg>
