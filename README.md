@@ -8,7 +8,7 @@ graphs, shortlist candidates, and export results.
 
 - Python 3.10 or newer
 - `curl` available on `PATH` for bulk downloads
-- `TESSify` 0.6.7 or newer
+- `TESSify` 0.6.9 or newer
 
 ## Installation
 
