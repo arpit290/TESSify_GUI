@@ -5,6 +5,7 @@ processing and project persistence come from the installed ``TESSify.Project``.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -12,10 +13,19 @@ import sys
 import textwrap
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
-from PySide6.QtCore import Qt, QRectF, QSettings, QSize, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import Qt, QRectF, QRegularExpression, QSettings, QSize, QThread, QUrl, Signal
+from PySide6.QtGui import (
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QRegularExpressionValidator,
+    QShortcut,
+)
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +35,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -163,7 +174,10 @@ TOOLTIPS = {
         "Cleans each downloaded file (removes NaNs, flattens the curve) and saves a plot "
         "of it in the project's Graphs folder.\n"
         "Files that can't be read (for example, a corrupt download) are skipped, reported, "
-        "and listed under process_failed in config.json. Processing again retries them."
+        "and listed under process_failed in config.json. Processing again retries them.\n"
+        "It also records each file's lowest and highest relative brightness, which the "
+        "Candidate Review brightness filter uses. Graphs made by an older version are "
+        "measured without being plotted again."
     ),
 
     # Candidate Review
@@ -182,6 +196,26 @@ TOOLTIPS = {
         "Save and exit the review (Escape). The next review starts after the last graph "
         "you reached."
     ),
+    "brightness_filter": (
+        "Show only the graphs whose recorded brightness falls inside the limits you set. "
+        "Brightness is relative: 1.0 is the star's typical brightness and 0.99 is 1% fainter.\n"
+        "Every graph has a lowest and a highest brightness, and each is checked against its "
+        "own limits. Leave a box empty for no limit.\n"
+        "Graphs with no recorded brightness (made by an older version) are hidden while a "
+        "limit is set; run Process Files to measure them.\n"
+        "While a filter is active your shortlist is still saved, but your review position is "
+        "not advanced, so graphs the filter hides are never counted as reviewed."
+    ),
+    "brightness_lowest": (
+        "Limits for each graph's lowest brightness, which is its deepest dip. For example, "
+        "a maximum of 0.99 keeps only graphs that dip at least 1% below normal."
+    ),
+    "brightness_highest": (
+        "Limits for each graph's highest brightness, which is its tallest spike. For example, "
+        "a maximum of 1.01 drops graphs with spikes (such as flares) over 1% above normal."
+    ),
+    "brightness_apply": "Apply the limits to the Review Queue (pressing Enter in a box does the same).",
+    "brightness_clear": "Remove all limits and show every graph again.",
 
     # Results & Export
     "export_results": (
@@ -269,6 +303,17 @@ class ProjectWrapper:
 
     def get_download_count(self) -> int:
         return len(self.state.downloaded)
+
+    def get_brightness_ranges(self) -> dict[str, tuple[float, float]]:
+        """Return {graph: (lowest, highest) relative brightness} as recorded by TESSify.
+
+        A graph with no entry has not been measured (it was made by an older TESSify, or
+        the installed TESSify predates brightness ranges). Callers treat that as "unknown".
+        """
+        getter = getattr(self.tessify_proj, "get_brightness_ranges", None)
+        if getter is None:
+            return {}
+        return dict(getter())
 
     def load_review_state(self) -> dict[str, Any]:
         return {
@@ -415,6 +460,47 @@ def set_tooltip(key: str, *widgets: QWidget | None) -> None:
     for widget in widgets:
         if widget is not None:  # e.g. labelForField() can return None
             widget.setToolTip(text)
+
+
+Bounds = tuple[float | None, float | None]  # (minimum, maximum); None means "no limit"
+
+
+def parse_bound(text: str, label: str) -> float | None:
+    """Turn the text of a filter box into a number; an empty box means no limit (None)."""
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{label}: \u201c{text}\u201d is not a number.") from None
+    if not math.isfinite(value):
+        raise ValueError(f"{label}: enter a finite number.")
+    return value
+
+
+def _within(value: float, bounds: Bounds) -> bool:
+    lower, upper = bounds
+    return (lower is None or value >= lower) and (upper is None or value <= upper)
+
+
+def filter_by_brightness(graphs: list[str], ranges: dict[str, tuple[float, float]],
+                         lowest: Bounds = (None, None), highest: Bounds = (None, None)) -> list[str]:
+    """Keep the graphs whose recorded brightness lies inside the given limits.
+
+    Each graph has a lowest and a highest relative brightness; `lowest` limits the first,
+    `highest` the second, and both ends of each limit are inclusive. With no limit at all
+    every graph is kept. Once any limit is set, a graph with no recorded brightness is
+    dropped, because there is nothing to say that it matches. Order is preserved.
+    """
+    if all(bound is None for bound in (*lowest, *highest)):
+        return list(graphs)
+    kept = []
+    for name in graphs:
+        measured = ranges.get(name)
+        if measured is not None and _within(measured[0], lowest) and _within(measured[1], highest):
+            kept.append(name)
+    return kept
 
 
 class SvgLogoLabel(QLabel):
@@ -944,9 +1030,13 @@ class CandidateReviewPage(QWidget):
     def __init__(self, main_window: "MainWindow"):
         super().__init__()
         self.main_win = main_window
-        self.graphs: list[str] = []
-        self.current_index = 0
+        self.all_graphs: list[str] = []   # every graph TESSify knows about, in processing order
+        self.graphs: list[str] = []       # the Review Queue: all_graphs after the brightness filter
+        self.brightness: dict[str, tuple[float, float]] = {}
+        self.current_index = 0            # position in self.graphs
         self.shortlist: list[str] = []
+        self._filter_active = False
+        self._filter_project: str | None = None  # project the filter boxes were last used with
         self._loading_list = False
         self._pixmap_cache: OrderedDict[str, QPixmap] = OrderedDict()
         self._build_ui()
@@ -967,6 +1057,7 @@ class CandidateReviewPage(QWidget):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 8, 0)
         left_layout.addWidget(QLabel("Review Queue"))
+        left_layout.addWidget(self._build_filter_box())
         self.list_widget = QListWidget()
         self.list_widget.currentRowChanged.connect(self.on_list_selection)
         left_layout.addWidget(self.list_widget, 1)
@@ -1033,34 +1124,147 @@ class CandidateReviewPage(QWidget):
         splitter.setSizes([270, 900])
         outer.addWidget(splitter, 1)
 
-        # Shortcuts are scoped to this page and never attached to a text input.
+        # Shortcuts are scoped to this page. The brightness filter boxes are text inputs, so while
+        # one has focus the keys stay with it (Esc hands focus back to the queue) instead of
+        # shortlisting a graph or leaving the review by accident.
         for key, slot in (
             (Qt.Key_Left, self.prev_graph),
             (Qt.Key_Right, self.next_graph),
             (Qt.Key_Down, self.shortlist_current),
             (Qt.Key_Up, self.unshortlist_current),
-            (Qt.Key_Escape, self.save_and_exit),
         ):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-            shortcut.activated.connect(slot)
+            shortcut.activated.connect(self._unless_typing(slot))
+        escape = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        escape.setContext(Qt.WidgetWithChildrenShortcut)
+        escape.activated.connect(self._escape)
+
+    def _unless_typing(self, slot: Callable[[], None]) -> Callable[[], None]:
+        """Wrap a shortcut so it does nothing while a filter box has keyboard focus."""
+        def run() -> None:
+            if not isinstance(QApplication.focusWidget(), QLineEdit):
+                slot()
+        return run
+
+    def _escape(self) -> None:
+        if isinstance(QApplication.focusWidget(), QLineEdit):
+            self.list_widget.setFocus()  # the first Esc just leaves the filter box
+        else:
+            self.save_and_exit()
+
+    # ---- brightness filter ----------------------------------------------------
+    def _build_filter_box(self) -> QGroupBox:
+        box = QGroupBox("Brightness filter")
+        set_tooltip("brightness_filter", box)
+        grid = QGridLayout(box)
+        grid.setHorizontalSpacing(6)
+        # key -> (minimum box, maximum box) for each of the two stored values
+        self.filter_boxes: dict[str, tuple[QLineEdit, QLineEdit]] = {}
+        for row, (key, title) in enumerate((("lowest", "Lowest"), ("highest", "Highest"))):
+            label = QLabel(title)
+            minimum = self._bound_edit("min")
+            maximum = self._bound_edit("max")
+            set_tooltip(f"brightness_{key}", label, minimum, maximum)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(minimum, row, 1)
+            grid.addWidget(QLabel("–"), row, 2)
+            grid.addWidget(maximum, row, 3)
+            self.filter_boxes[key] = (minimum, maximum)
+
+        buttons = QHBoxLayout()
+        self.btn_filter_apply = QPushButton("Apply")
+        self.btn_filter_apply.clicked.connect(self.apply_filter)
+        self.btn_filter_clear = QPushButton("Clear")
+        self.btn_filter_clear.clicked.connect(self.clear_filter)
+        set_tooltip("brightness_apply", self.btn_filter_apply)
+        set_tooltip("brightness_clear", self.btn_filter_clear)
+        buttons.addWidget(self.btn_filter_apply)
+        buttons.addWidget(self.btn_filter_clear)
+        grid.addLayout(buttons, 2, 0, 1, 4)
+
+        self.lbl_filter_info = QLabel("")
+        self.lbl_filter_info.setObjectName("PageSubtitle")
+        self.lbl_filter_info.setWordWrap(True)
+        grid.addWidget(self.lbl_filter_info, 3, 0, 1, 4)
+        return box
+
+    def _bound_edit(self, placeholder: str) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setPlaceholderText(placeholder)
+        edit.setMinimumWidth(48)
+        # Digits with an optional leading minus and one decimal point; parse_bound() does the final check.
+        edit.setValidator(QRegularExpressionValidator(QRegularExpression(r"^-?\d*\.?\d*$"), edit))
+        edit.returnPressed.connect(self.apply_filter)
+        return edit
+
+    def _read_bounds(self) -> tuple[Bounds, Bounds]:
+        """Read the filter boxes as (lowest limits, highest limits). Raises ValueError on bad input."""
+        limits = []
+        for key, title in (("lowest", "Lowest"), ("highest", "Highest")):
+            minimum_box, maximum_box = self.filter_boxes[key]
+            minimum = parse_bound(minimum_box.text(), f"{title} min")
+            maximum = parse_bound(maximum_box.text(), f"{title} max")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"{title}: the minimum is above the maximum.")
+            limits.append((minimum, maximum))
+        return limits[0], limits[1]
+
+    def _clear_filter_fields(self) -> None:
+        for minimum_box, maximum_box in self.filter_boxes.values():
+            minimum_box.clear()
+            maximum_box.clear()
+
+    def apply_filter(self) -> None:
+        """Rebuild the Review Queue from the limits typed into the brightness filter."""
+        if self.main_win.current_project is None:
+            return
+        try:
+            self._read_bounds()
+        except ValueError as error:
+            self.lbl_filter_info.setText(str(error))  # keep the current queue and say what is wrong
+            return
+        self._show_queue(keep=self._current_filename())
+
+    def clear_filter(self) -> None:
+        self._clear_filter_fields()
+        if self.main_win.current_project is not None:
+            self._show_queue(keep=self._current_filename())
+
+    def _review_payload(self) -> dict[str, Any]:
+        """What to persist. The position is only saved for the unfiltered queue.
+
+        TESSify treats reaching image N as having reviewed everything before it. A filtered queue
+        skips graphs on purpose, so saving a position would mark graphs nobody looked at as
+        reviewed. While a filter is active only the shortlist is saved.
+        """
+        payload: dict[str, Any] = {"shortlist": self.shortlist}
+        if not self._filter_active:
+            payload["last_index"] = self.current_index
+        return payload
 
     def load_review(self) -> None:
         project = self.main_win.current_project
         if project is None:
+            self.all_graphs = []
             self.graphs = []
+            self.brightness = {}
             self.shortlist = []
             self.list_widget.clear()
             self.lbl_image.setText("Please open a project first.")
             self.lbl_info.setText("No project open")
+            self.lbl_filter_info.setText("")
             self._update_buttons()
             return
 
         try:
-            self.graphs = project.get_graphs()
+            all_graphs = project.get_graphs()
             saved_state = project.load_review_state()
+            brightness = project.get_brightness_ranges()
         except Exception as error:
+            self.all_graphs = []
             self.graphs = []
+            self.brightness = {}
             self.shortlist = []
             self.list_widget.clear()
             self.lbl_image.setPixmap(QPixmap())
@@ -1068,10 +1272,36 @@ class CandidateReviewPage(QWidget):
             self.lbl_info.setText(str(error))
             self._update_buttons()
             return
+        same_project = project.project_path == self._filter_project
+        viewing = self._current_filename()  # the graph on screen before this reload
+        self.all_graphs = all_graphs
+        self.brightness = brightness
+        if not same_project:
+            self._clear_filter_fields()  # limits typed for another project do not carry over
+            self._filter_project = project.project_path
         self._pixmap_cache.clear()  # refreshed graph files must not reuse stale/broken cached images
         self.shortlist = list(saved_state.get("shortlist", []))
-        self.current_index = int(saved_state.get("last_index", 0) or 0)
-        self.current_index = min(max(self.current_index, 0), max(0, len(self.graphs) - 1))
+        saved_index = int(saved_state.get("last_index", 0) or 0)
+        saved_index = min(max(saved_index, 0), max(0, len(self.all_graphs) - 1))
+        resume = self.all_graphs[saved_index] if self.all_graphs else None
+        if same_project and self._filter_active and viewing in self.all_graphs:
+            resume = viewing  # a filtered queue doesn't save its position, so keep the user's place
+        self._show_queue(keep=resume)
+
+    def _show_queue(self, keep: str | None) -> None:
+        """Build the Review Queue from all_graphs and the filter boxes, then show one graph.
+
+        `keep` is the graph to stay on if it is still in the queue; otherwise the first one is shown.
+        """
+        note = ""
+        try:
+            lowest, highest = self._read_bounds()
+        except ValueError as error:  # unusable text left in a box: show everything and say why
+            lowest = highest = (None, None)
+            note = str(error)
+        self._filter_active = any(bound is not None for bound in (*lowest, *highest))
+        self.graphs = filter_by_brightness(self.all_graphs, self.brightness, lowest, highest)
+        self.current_index = self.graphs.index(keep) if keep in self.graphs else 0
 
         self._loading_list = True
         self.list_widget.blockSignals(True)
@@ -1085,14 +1315,44 @@ class CandidateReviewPage(QWidget):
             self.list_widget.setCurrentRow(self.current_index)
         self.list_widget.blockSignals(False)
         self._loading_list = False
-        self.lbl_queue_count.setText(f"{len(self.graphs)} graph(s) available")
+        self._update_queue_labels(note)
         if not self.graphs:
             self.lbl_image.setPixmap(QPixmap())
-            self.lbl_image.setText("No graphs found yet. Run Process Files first.")
-            self.lbl_info.setText("Candidate review is empty")
+            if self.all_graphs:
+                self.lbl_image.setText("No graphs match the brightness filter.\nChange or clear the limits.")
+                self.lbl_info.setText("No graphs match the brightness filter")
+            else:
+                self.lbl_image.setText("No graphs found yet. Run Process Files first.")
+                self.lbl_info.setText("Candidate review is empty")
         else:
             self.display_current()
         self._update_buttons()
+
+    def _update_queue_labels(self, note: str = "") -> None:
+        total = len(self.all_graphs)
+        if self._filter_active:
+            self.lbl_queue_count.setText(f"{len(self.graphs)} of {total} graph(s) shown")
+        else:
+            self.lbl_queue_count.setText(f"{total} graph(s) available")
+
+        measured = [self.brightness[name] for name in self.all_graphs if name in self.brightness]
+        if note:
+            info = note
+        elif not total:
+            info = "No graphs to filter yet."
+        elif not measured:
+            info = "No brightness recorded yet. Run Process Files to measure it."
+        else:
+            lows = [low for low, _ in measured]
+            highs = [high for _, high in measured]
+            info = (
+                f"Recorded for {len(measured)} of {total} graphs. "
+                f"Lowest values run from {min(lows):.4f} to {max(lows):.4f}; "
+                f"highest from {min(highs):.4f} to {max(highs):.4f}."
+            )
+            if self._filter_active and len(measured) < total:
+                info += f" {total - len(measured)} graph(s) without data are hidden."
+        self.lbl_filter_info.setText(info)
 
     def _current_filename(self) -> str | None:
         if 0 <= self.current_index < len(self.graphs):
@@ -1123,8 +1383,11 @@ class CandidateReviewPage(QWidget):
         identifier = tic_id(filename)
         id_text = f"  |  {identifier}" if identifier else ""
         status_text = "Shortlisted" if filename in self.shortlist else "Not shortlisted"
+        measured = self.brightness.get(filename)
+        brightness_text = f"  |  Brightness {measured[0]:.5f} – {measured[1]:.5f}" if measured else ""
         self.lbl_info.setText(
             f"Candidate {self.current_index + 1} of {len(self.graphs)}  |  {filename}{id_text}  |  {status_text}"
+            f"{brightness_text}"
         )
         pixmap = self._get_pixmap(full_path)
         if pixmap.isNull():
@@ -1205,7 +1468,7 @@ class CandidateReviewPage(QWidget):
         else:
             return
         try:
-            project.save_review_state({"shortlist": self.shortlist, "last_index": self.current_index})
+            project.save_review_state(self._review_payload())
         except Exception as error:
             self.shortlist = old_shortlist
             self._refresh_queue_labels()
@@ -1233,7 +1496,7 @@ class CandidateReviewPage(QWidget):
         if project is None:
             return False
         try:
-            project.save_review_state({"shortlist": self.shortlist, "last_index": self.current_index})
+            project.save_review_state(self._review_payload())
             self.main_win.set_status("Review progress saved")
             return True
         except Exception as error:
@@ -1438,7 +1701,8 @@ class HelpAboutPage(QWidget):
             "1. Create a new project or open a folder containing a TESSify config.json.\n"
             "2. Download Light Curve (lc) or Target Pixel (tp) FITS files using a TESS bulk script. curl must be on PATH.\n"
             "3. Process the downloaded files to generate graphs. Processing requires the package's scientific dependencies.\n"
-            "4. Review the graphs. Shortlist and remove candidates; decisions and the current position are saved to config.json.\n"
+            "4. Review the graphs. Shortlist and remove candidates; decisions and the current position are saved to config.json. "
+            "The Brightness filter narrows the queue by each graph's lowest and highest relative brightness, which is recorded when a file is processed (1.0 is the star's typical brightness).\n"
             "5. Export the unique TIC IDs as JSON using the package's existing results API.\n\n"
             "Keyboard shortcuts in Candidate Review: Left = previous, Right = next, Down = shortlist, Up = remove from shortlist, Esc = save and exit review.\n\n"
             "GitHub: https://github.com/arpit290/TESSify\n\n"
